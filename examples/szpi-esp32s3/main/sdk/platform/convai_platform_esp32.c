@@ -16,6 +16,7 @@
 
 #include "convai_platform_esp32.h"
 #include "convai_platform_esp32_internal.h"
+#include "certs/convai_aia_chain.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -43,6 +44,10 @@ static const convai_platform_t g_convai_platform = {
         .thread_destroy = esp32_thread_destroy,
         .fill_random = esp32_fill_random,
         .strdup = esp32_strdup,
+        .file_write = esp32_file_write,
+        .file_read = esp32_file_read,
+        .file_exists = esp32_file_exists,
+        .file_remove = esp32_file_remove,
     },
     .netal = {
         .socket_create = esp32_socket_create,
@@ -79,6 +84,13 @@ static const convai_platform_t g_convai_platform = {
 int convai_platform_esp32_init(void) {
   ESP_LOGI(TAG, "Registering ESP32 platform HAL (ABI 0x%04x)",
            CONVAI_ABI_VERSION);
+
+  /* Initialize AIA chain completion subsystem */
+  convai_aia_chain_init();
+
+  /* Set trust store path for AIA certificate persistence */
+  convai_aia_chain_set_truststore("/data/trust_store");
+
   return convai_platform_init(&g_convai_platform);
 }
 
@@ -124,3 +136,4 @@ esp_err_t platform_factory_init_by_name(const char *name) {
   }
   return s_factory->init();
 }
+

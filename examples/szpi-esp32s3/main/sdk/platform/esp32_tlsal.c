@@ -17,7 +17,9 @@
 #include "lwip/sockets.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
+#include "mbedtls/ssl.h"
 #include "psa/crypto.h"
+#include "certs/convai_aia_chain.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -64,6 +66,238 @@ static int esp32_tls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
 }
 
 /* ===================================================================
+ *  HTTPS fetch callback for AIA certificate chasing (ESP32)
+ * =================================================================== */
+
+/**
+ * @brief Platform-specific HTTPS fetch for AIA certificates (ESP32).
+ *
+ * Creates a temporary TLS connection to fetch DER-encoded certificates from
+ * HTTPS URLs. Uses VERIFY_NONE to avoid recursive AIA chasing.
+ * Uses PSA crypto (hardware TRNG) and raw lwip sockets.
+ *
+ * @param url         [in]  HTTPS URL (e.g., "https://example.com/ca.der").
+ * @param out_der     [out] Buffer for DER certificate data.
+ * @param out_buf_len [in]  Size of out_der buffer.
+ * @param out_der_len [out] Actual bytes received.
+ *
+ * @return 0 on success, negative on error.
+ */
+static int esp32_https_fetch_ca_der(const char *url,
+                                    uint8_t *out_der,
+                                    size_t out_buf_len,
+                                    size_t *out_der_len) {
+  if (url == NULL || out_der == NULL || out_der_len == NULL) {
+    return -1;
+  }
+  *out_der_len = 0;
+
+  /* Parse HTTPS URL: https://host[:port]/path */
+  if (strncmp(url, "https://", 8) != 0) {
+    ESP_LOGW(TAG, "AIA fetch: non-HTTPS URL rejected: %s", url);
+    return -2;
+  }
+  const char *host_start = url + 8;
+  const char *path_start = strchr(host_start, '/');
+  if (path_start == NULL) {
+    path_start = "/";
+  }
+
+  char host[256];
+  uint16_t port = 443;
+  const char *colon = strchr(host_start, ':');
+  const char *host_end = path_start;
+
+  if (colon != NULL && colon < path_start) {
+    /* host:port format */
+    size_t hlen = colon - host_start;
+    if (hlen >= sizeof(host)) return -2;
+    memcpy(host, host_start, hlen);
+    host[hlen] = '\0';
+    port = (uint16_t)atoi(colon + 1);
+  } else {
+    size_t hlen = host_end - host_start;
+    if (hlen >= sizeof(host)) return -2;
+    memcpy(host, host_start, hlen);
+    host[hlen] = '\0';
+  }
+
+  ESP_LOGI(TAG, "AIA fetch: connecting to %s:%d%s", host, port, path_start);
+
+  /* Resolve hostname */
+  struct addrinfo hints = {0};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  char port_str[8];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  struct addrinfo *res = NULL;
+  int ret = getaddrinfo(host, port_str, &hints, &res);
+  if (ret != 0 || res == NULL) {
+    ESP_LOGW(TAG, "AIA fetch: DNS resolution failed for %s", host);
+    if (res) freeaddrinfo(res);
+    return -3;
+  }
+
+  /* Create socket */
+  int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd < 0) {
+    ESP_LOGW(TAG, "AIA fetch: socket creation failed");
+    freeaddrinfo(res);
+    return -3;
+  }
+
+  /* Connect */
+  ret = connect(fd, res->ai_addr, res->ai_addrlen);
+  freeaddrinfo(res);
+  if (ret != 0) {
+    ESP_LOGW(TAG, "AIA fetch: connect failed");
+    close(fd);
+    return -3;
+  }
+
+  /* Create temporary TLS context */
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+
+  ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+  if (ret != 0) {
+    ESP_LOGE(TAG, "AIA fetch: SSL config defaults failed: -0x%x", (unsigned int)(-ret));
+    ret = -4;
+    goto cleanup;
+  }
+
+  mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);  /* Avoid recursion */
+  mbedtls_ssl_conf_dbg(&conf, NULL, NULL);
+
+  ret = mbedtls_ssl_setup(&ssl, &conf);
+  if (ret != 0) {
+    ESP_LOGE(TAG, "AIA fetch: SSL setup failed: -0x%x", (unsigned int)(-ret));
+    ret = -4;
+    goto cleanup;
+  }
+
+  /* BIO callbacks for temporary socket */
+  int temp_fd = fd;
+  mbedtls_ssl_set_bio(&ssl, &temp_fd,
+                      (mbedtls_ssl_send_t *)send,
+                      (mbedtls_ssl_recv_t *)recv,
+                      NULL);
+  mbedtls_ssl_set_hostname(&ssl, host);
+
+  /* Perform TLS handshake */
+  ret = mbedtls_ssl_handshake(&ssl);
+  if (ret != 0) {
+    ESP_LOGW(TAG, "AIA fetch: TLS handshake failed: -0x%x", (unsigned int)(-ret));
+    ret = -5;
+    goto cleanup;
+  }
+
+  /* Send HTTP GET request */
+  char http_req[512];
+  int req_len = snprintf(http_req, sizeof(http_req),
+                         "GET %s HTTP/1.1\r\n"
+                         "Host: %s\r\n"
+                         "Connection: close\r\n"
+                         "User-Agent: ConvAI-SDK/1.0\r\n"
+                         "\r\n",
+                         path_start, host);
+  if (req_len <= 0 || req_len >= (int)sizeof(http_req)) {
+    ret = -5;
+    goto cleanup;
+  }
+
+  ret = mbedtls_ssl_write(&ssl, (const unsigned char *)http_req, req_len);
+  if (ret < 0) {
+    ESP_LOGW(TAG, "AIA fetch: write failed: -0x%x", (unsigned int)(-ret));
+    ret = -5;
+    goto cleanup;
+  }
+
+  /* Receive HTTP response */
+  uint8_t resp_buf[4096 + 512];  /* Cert + headers */
+  size_t total_recv = 0;
+
+  while (total_recv < sizeof(resp_buf)) {
+    ret = mbedtls_ssl_read(&ssl, resp_buf + total_recv,
+                           sizeof(resp_buf) - total_recv);
+    if (ret < 0) {
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+          ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        continue;
+      }
+      break;  /* EOF or error */
+    }
+    if (ret == 0) {
+      break;  /* Connection closed */
+    }
+    total_recv += ret;
+  }
+
+  if (total_recv == 0) {
+    ESP_LOGW(TAG, "AIA fetch: no response from %s", host);
+    ret = -6;
+    goto cleanup;
+  }
+
+  /* Parse HTTP response: find status line */
+  const char *resp_str = (const char *)resp_buf;
+  if (strncmp(resp_str, "HTTP/", 5) != 0) {
+    ESP_LOGW(TAG, "AIA fetch: invalid HTTP response");
+    ret = -6;
+    goto cleanup;
+  }
+
+  /* Find status code */
+  const char *status_start = strchr(resp_str, ' ');
+  if (status_start == NULL) {
+    ret = -6;
+    goto cleanup;
+  }
+  int status_code = atoi(status_start + 1);
+  if (status_code != 200) {
+    ESP_LOGW(TAG, "AIA fetch: HTTP %d from %s", status_code, url);
+    ret = -6;
+    goto cleanup;
+  }
+
+  /* Find body (after \r\n\r\n) */
+  const char *body_start = strstr(resp_str, "\r\n\r\n");
+  if (body_start == NULL) {
+    ESP_LOGW(TAG, "AIA fetch: no body delimiter in response");
+    ret = -6;
+    goto cleanup;
+  }
+  body_start += 4;
+
+  size_t body_len = total_recv - (body_start - resp_str);
+  if (body_len > out_buf_len) {
+    ESP_LOGW(TAG, "AIA fetch: response too large (%zu bytes)", body_len);
+    ret = -7;
+    goto cleanup;
+  }
+
+  /* Copy DER certificate to output buffer */
+  memcpy(out_der, body_start, body_len);
+  *out_der_len = body_len;
+  ret = 0;
+
+  ESP_LOGI(TAG, "AIA fetch: got %zu bytes from %s", body_len, url);
+
+cleanup:
+  mbedtls_ssl_free(&ssl);
+  mbedtls_ssl_config_free(&conf);
+  close(fd);
+  return ret;
+}
+
+/* ===================================================================
  *  Lifecycle
  * =================================================================== */
 
@@ -101,6 +335,8 @@ int esp32_tls_create(convai_tls_t **tls) {
     ESP_LOGE(TAG, "ssl_setup failed: -0x%x", (unsigned int)(-ret));
     goto fail;
   }
+
+  convai_aia_chain_set_https_fetch(esp32_https_fetch_ca_der);
 
   *tls = t;
   return 0;
@@ -147,6 +383,7 @@ int esp32_tls_connect(convai_tls_t *tls, void *sock, const char *host,
     }
     mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->cacert, NULL);
     mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_verify(&tls->conf, convai_aia_verify_callback, &tls->cacert);
     ESP_LOGI(TAG, "TLS VERIFY_REQUIRED (CA cert loaded, %d bytes)",
              (int)strlen(ca_cert));
   } else {
@@ -243,3 +480,4 @@ int esp32_tls_close(convai_tls_t *tls) {
   tls->connected = 0;
   return 0;
 }
+

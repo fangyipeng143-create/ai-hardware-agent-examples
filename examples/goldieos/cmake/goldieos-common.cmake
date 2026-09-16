@@ -120,6 +120,7 @@ function(goldieos_target_add_common)
 
     target_include_directories("${_arg_TARGET}" PRIVATE
         "${CMAKE_SOURCE_DIR}/include"
+        "${CMAKE_SOURCE_DIR}/src"
         "${_arg_SOURCE_DIR}/sdk_integration"
         "${_arg_SOURCE_DIR}/compat"
         "${_arg_SOURCE_DIR}/include"
@@ -160,4 +161,9 @@ function(goldieos_target_add_common)
     )
 
     target_compile_definitions("${_arg_TARGET}" PRIVATE CUSTOM_MODES)
+#
+#    if(CONVAI_DEFAULT_CODEC EQUAL 2)
+#        target_compile_definitions("${_arg_TARGET}" PRIVATE CONFIG_APP_ENABLE_OPUS)
+#    endif()
 endfunction()
+

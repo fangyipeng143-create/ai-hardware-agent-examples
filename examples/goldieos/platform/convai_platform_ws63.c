@@ -18,6 +18,7 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
+#include "certs/convai_aia_chain.h"
 
 /* Forward-declare poll_table for lwip/sockets.h (WS63 lwip header uses it
  * in a function prototype without including poll.h). */
@@ -283,6 +284,7 @@ static int ws63_socket_create(convai_socket_t **sock) {
 
 static int ws63_socket_destroy(convai_socket_t *sock) {
     if (sock == NULL) return 0;
+    printf("[sock] destroy: BEGIN sock=%p fd=%d\n", (void*)sock, sock->net.fd);
     /* Explicitly close the lwIP fd. mbedtls_net_free() in the prebuilt mbedtls
      * lib may call musl close() (not lwip_close), which does NOT release the
      * lwIP socket — the fd then leaks (observed fd 0→1→... across reconnects),
@@ -294,7 +296,9 @@ static int ws63_socket_destroy(convai_socket_t *sock) {
         sock->net.fd = -1;
     }
     mbedtls_net_free(&sock->net);
+    printf("[sock] destroy: before goldie_free(sock) sock=%p\n", (void*)sock);
     goldie_free(sock);
+    printf("[sock] destroy: END\n");
     return 0;
 }
 
@@ -440,6 +444,227 @@ static int ws63_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
     return mbedtls_net_recv(&sock->net, buf, len);
 }
 
+/* ===== HTTPS fetch callback for AIA certificate chasing (WS63) ===== */
+
+/**
+ * @brief Platform-specific HTTPS fetch for AIA certificates (WS63).
+ *
+ * Creates a temporary TLS connection to fetch DER-encoded certificates from
+ * HTTPS URLs. Uses VERIFY_NONE to avoid recursive AIA chasing.
+ *
+ * @param url         [in]  HTTPS URL (e.g., "https://example.com/ca.der").
+ * @param out_der     [out] Buffer for DER certificate data.
+ * @param out_buf_len [in]  Size of out_der buffer.
+ * @param out_der_len [out] Actual bytes received.
+ *
+ * @return 0 on success, negative on error.
+ */
+static int ws63_https_fetch_ca_der(const char *url,
+                                   uint8_t *out_der,
+                                   size_t out_buf_len,
+                                   size_t *out_der_len)
+{
+    if (url == NULL || out_der == NULL || out_der_len == NULL) {
+        return -1;
+    }
+    *out_der_len = 0;
+
+    /* Parse HTTPS URL: https://host[:port]/path */
+    if (strncmp(url, "https://", 8) != 0) {
+        printf("[W] AIA fetch: non-HTTPS URL rejected: %s\n", url);
+        return -2;
+    }
+    const char *host_start = url + 8;
+    const char *path_start = strchr(host_start, '/');
+    if (path_start == NULL) {
+        path_start = "/";
+    }
+
+    char host[256];
+    uint16_t port = 443;
+    const char *colon = strchr(host_start, ':');
+    const char *host_end = path_start;
+
+    if (colon != NULL && colon < path_start) {
+        /* host:port format */
+        size_t hlen = colon - host_start;
+        if (hlen >= sizeof(host)) return -2;
+        memcpy(host, host_start, hlen);
+        host[hlen] = '\0';
+        port = (uint16_t)atoi(colon + 1);
+    } else {
+        size_t hlen = host_end - host_start;
+        if (hlen >= sizeof(host)) return -2;
+        memcpy(host, host_start, hlen);
+        host[hlen] = '\0';
+    }
+
+    printf("[I] AIA fetch: connecting to %s:%d%s\n", host, port, path_start);
+
+    /* Create temporary socket */
+    mbedtls_net_context net_ctx;
+    mbedtls_net_init(&net_ctx);
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    int ret = mbedtls_net_connect(&net_ctx, host, port_str, MBEDTLS_NET_PROTO_TCP);
+    if (ret != 0) {
+        printf("[W] AIA fetch: connect failed: -0x%x\n", (unsigned int)(-ret));
+        mbedtls_net_free(&net_ctx);
+        return -3;
+    }
+
+    /* Create temporary TLS context */
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                                 (const unsigned char *)"aia_fetch", 9);
+    if (ret != 0) {
+        printf("[E] AIA fetch: CTR_DRBG seed failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -4;
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                       MBEDTLS_SSL_TRANSPORT_STREAM,
+                                       MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+        printf("[E] AIA fetch: SSL config defaults failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -4;
+        goto cleanup;
+    }
+
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);  /* Avoid recursion */
+    mbedtls_ssl_conf_dbg(&conf, NULL, NULL);
+
+    ret = mbedtls_ssl_setup(&ssl, &conf);
+    if (ret != 0) {
+        printf("[E] AIA fetch: SSL setup failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -4;
+        goto cleanup;
+    }
+
+    mbedtls_ssl_set_bio(&ssl, &net_ctx, mbedtls_net_send, mbedtls_net_recv, NULL);
+    mbedtls_ssl_set_hostname(&ssl, host);
+
+    /* Perform TLS handshake */
+    ret = mbedtls_ssl_handshake(&ssl);
+    if (ret != 0) {
+        printf("[W] AIA fetch: TLS handshake failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -5;
+        goto cleanup;
+    }
+
+    /* Send HTTP GET request */
+    char http_req[512];
+    int req_len = snprintf(http_req, sizeof(http_req),
+                           "GET %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Connection: close\r\n"
+                           "User-Agent: ConvAI-SDK/1.0\r\n"
+                           "\r\n",
+                           path_start, host);
+    if (req_len <= 0 || req_len >= (int)sizeof(http_req)) {
+        ret = -5;
+        goto cleanup;
+    }
+
+    ret = mbedtls_ssl_write(&ssl, (const unsigned char *)http_req, req_len);
+    if (ret < 0) {
+        printf("[W] AIA fetch: write failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -5;
+        goto cleanup;
+    }
+
+    /* Receive HTTP response */
+    uint8_t resp_buf[4096 + 512];  /* Cert + headers */
+    size_t total_recv = 0;
+
+    while (total_recv < sizeof(resp_buf)) {
+        ret = mbedtls_ssl_read(&ssl, resp_buf + total_recv,
+                               sizeof(resp_buf) - total_recv);
+        if (ret < 0) {
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+                ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                continue;
+            }
+            break;  /* EOF or error */
+        }
+        if (ret == 0) {
+            break;  /* Connection closed */
+        }
+        total_recv += ret;
+    }
+
+    if (total_recv == 0) {
+        printf("[W] AIA fetch: no response from %s\n", host);
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Parse HTTP response: find status line */
+    const char *resp_str = (const char *)resp_buf;
+    if (strncmp(resp_str, "HTTP/", 5) != 0) {
+        printf("[W] AIA fetch: invalid HTTP response\n");
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Find status code */
+    const char *status_start = strchr(resp_str, ' ');
+    if (status_start == NULL) {
+        ret = -6;
+        goto cleanup;
+    }
+    int status_code = atoi(status_start + 1);
+    if (status_code != 200) {
+        printf("[W] AIA fetch: HTTP %d from %s\n", status_code, url);
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Find body (after \r\n\r\n) */
+    const char *body_start = strstr(resp_str, "\r\n\r\n");
+    if (body_start == NULL) {
+        printf("[W] AIA fetch: no body delimiter in response\n");
+        ret = -6;
+        goto cleanup;
+    }
+    body_start += 4;
+
+    size_t body_len = total_recv - (body_start - resp_str);
+    if (body_len > out_buf_len) {
+        printf("[W] AIA fetch: response too large (%zu bytes)\n", body_len);
+        ret = -7;
+        goto cleanup;
+    }
+
+    /* Copy DER certificate to output buffer */
+    memcpy(out_der, body_start, body_len);
+    *out_der_len = body_len;
+    ret = 0;
+
+    printf("[I] AIA fetch: got %zu bytes from %s\n", body_len, url);
+
+cleanup:
+    mbedtls_ssl_free(&ssl);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_net_free(&net_ctx);
+    return ret;
+}
+
 static int ws63_tls_create(convai_tls_t **tls)
 {
     if (tls == NULL) return -1;
@@ -476,6 +701,9 @@ static int ws63_tls_create(convai_tls_t **tls)
     ret = mbedtls_ssl_setup(&t->ssl, &t->conf);
     if (ret != 0) goto tls_create_fail;
 
+    /* Register HTTPS fetch callback for AIA certificate chasing */
+    convai_aia_chain_set_https_fetch(ws63_https_fetch_ca_der);
+
     *tls = t;
     return 0;
 
@@ -495,12 +723,38 @@ tls_create_fail:
 static int ws63_tls_destroy(convai_tls_t *tls)
 {
     if (tls == NULL) return 0;
+    /* Alignment check: a corrupted tls pointer (garbage from heap/UAF) is likely
+     * unaligned. LiteOS allocates 16B-aligned, so any valid tls is aligned.
+     * Skip all mbedtls free on a bad pointer — better to leak than to feed a
+     * corrupted struct into mbedtls_ssl_free (which may memset wild ptr via
+     * mpi_free with a corrupted n field). */
+    if (((unsigned int)(uintptr_t)tls & 0x3) != 0) {
+        printf("[tls] destroy: BAD ALIGN tls=%p — skip free\n", (void*)tls);
+        return -1;
+    }
+    /* Diagnostic probe: log tls state before each mbedtls free. If a crash
+     * happens during stop teardown, these lines reveal which mbedtls_*_free
+     * was executing and whether the tls struct was already corrupted
+     * (connected/ssl_state out of range). Zero extra RAM — reads existing
+     * fields only. Runs only on the stop/destroy path, not in the hot loop.
+     *
+     * NOTE: ssl_state is logged for diagnosis only — it is NOT range-checked
+     * to skip ssl_free. The legal range depends on mbedTLS compile config
+     * (TLS1.2/1.3, extensions) and cannot be safely bounded without reading
+     * the exact enum. A corrupted ssl context may still have a state value
+     * inside any plausible range, so range-checking gives false security. */
+    printf("[tls] destroy: BEGIN tls=%p connected=%d ssl_state=%d\n",
+           (void*)tls, tls->connected, (int)tls->ssl.MBEDTLS_PRIVATE(state));
     mbedtls_ssl_free(&tls->ssl);
+    printf("[tls] destroy: after ssl_free tls=%p\n", (void*)tls);
     mbedtls_ssl_config_free(&tls->conf);
+    printf("[tls] destroy: after config_free tls=%p\n", (void*)tls);
     mbedtls_ctr_drbg_free(&tls->ctr_drbg);
     mbedtls_entropy_free(&tls->entropy);
     mbedtls_x509_crt_free(&tls->cacert);
+    printf("[tls] destroy: before goldie_free(tls) tls=%p\n", (void*)tls);
     goldie_free(tls);
+    printf("[tls] destroy: END\n");
     return 0;
 }
 
@@ -532,6 +786,7 @@ static int ws63_tls_connect(convai_tls_t *tls, void *sock, const char *host,
         }
         mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->cacert, NULL);
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_verify(&tls->conf, convai_aia_verify_callback, &tls->cacert);
         printf("[I] VERIFY_REQUIRED (CA cert loaded, %d bytes)\n",
                (int)strlen(ca_cert));
     } else {
@@ -611,6 +866,17 @@ static int ws63_tls_write(convai_tls_t *tls, const uint8_t *buf, size_t len, siz
 static int ws63_tls_close(convai_tls_t *tls)
 {
     if (tls == NULL) return -1;
+    /* Skip close_notify on an already-disconnected TLS session — calling it on a
+     * peer-closed / dead socket can re-enter mbedtls internal read paths on an
+     * inconsistent ssl context (observed crash signature: memset wild ptr with
+     * ra inside mbedtls_mpi_mul_mpi). connected==0 means we never handshaked or
+     * already closed; close_notify is pointless and risky in that state. */
+    if (!tls->connected) {
+        printf("[tls] close: skip close_notify (already disconnected, tls=%p)\n", (void*)tls);
+        return 0;
+    }
+    printf("[tls] close: close_notify tls=%p ssl_state=%d\n",
+           (void*)tls, (int)tls->ssl.MBEDTLS_PRIVATE(state));
     mbedtls_ssl_close_notify(&tls->ssl);
     tls->connected = 0;
     return 0;
@@ -793,5 +1059,11 @@ const convai_platform_t g_convai_platform = {
 };
 
 int convai_platform_ws63_init(void) {
+    /* Initialize AIA chain completion subsystem */
+    convai_aia_chain_init();
+
+    /* Configure volatile-only trust store (WS63 has no writable FS) */
+    convai_aia_chain_set_truststore(NULL);
+
     return convai_platform_init(&g_convai_platform);
 }

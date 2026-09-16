@@ -87,6 +87,10 @@ void esp32_thread_join(convai_thread_t *thread);
 void esp32_thread_destroy(convai_thread_t *thread);
 int esp32_fill_random(uint8_t *buf, size_t len);
 char *esp32_strdup(const char *s);
+int esp32_file_write(const char *path, const uint8_t *data, size_t len);
+int esp32_file_read(const char *path, uint8_t *buf, size_t buf_len, size_t *out_len);
+int esp32_file_exists(const char *path);
+int esp32_file_remove(const char *path);
 
 /* ===================================================================
  *  NetAL (esp32_netal.c)
@@ -135,3 +139,4 @@ int esp32_network_get_type(char *buf, size_t size);
 #endif
 
 #endif /* CONVAI_PLATFORM_ESP32_INTERNAL_H */
+

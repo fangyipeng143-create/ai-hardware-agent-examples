@@ -26,6 +26,8 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
+#include "certs/convai_aia_chain.h"
+#include "certs/convai_aia_parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +57,10 @@ struct convai_tls_s {
     mbedtls_x509_crt cacert;
     convai_socket_t *sock;  /* 持有 socket 引用 */
     int connected;
+    int aia_attempted;      /* AIA chain completion already attempted */
+    /* Saved peer cert raw data for post-handshake AIA retry */
+    uint8_t saved_peer_cert[8192];
+    size_t saved_peer_cert_len;
 };
 
 /* ===== Winsock 惰性初始化 (WSAStartup 只需调用一次) ===== */
@@ -72,6 +78,264 @@ static int win_wsa_init(void)
     }
     wsa_started = 1;
     return 0;
+}
+
+/* ===== HTTPS fetch callback for AIA certificate chasing ===== */
+
+/**
+ * @brief Platform-specific HTTPS fetch for AIA certificates (Windows).
+ *
+ * Creates a temporary TLS connection to fetch DER-encoded certificates from
+ * HTTPS URLs. Uses VERIFY_NONE to avoid recursive AIA chasing.
+ *
+ * @param url         [in]  HTTPS URL (e.g., "https://example.com/ca.der").
+ * @param out_der     [out] Buffer for DER certificate data.
+ * @param out_buf_len [in]  Size of out_der buffer.
+ * @param out_der_len [out] Actual bytes received.
+ *
+ * @return 0 on success, negative on error.
+ */
+static int win_https_fetch_ca_der(const char *url,
+                                  uint8_t *out_der,
+                                  size_t out_buf_len,
+                                  size_t *out_der_len)
+{
+    if (url == NULL || out_der == NULL || out_der_len == NULL) {
+        return -1;
+    }
+    *out_der_len = 0;
+
+    /* Parse URL: support both http:// and https:// */
+    int use_tls = 0;
+    const char *host_start = NULL;
+    uint16_t default_port = 80;
+
+    if (strncmp(url, "https://", 8) == 0) {
+        use_tls = 1;
+        host_start = url + 8;
+        default_port = 443;
+    } else if (strncmp(url, "http://", 7) == 0) {
+        use_tls = 0;
+        host_start = url + 7;
+        default_port = 80;
+    } else {
+        printf("[W] AIA fetch: unsupported URL scheme: %s\n", url);
+        return -2;
+    }
+
+    const char *path_start = strchr(host_start, '/');
+    if (path_start == NULL) {
+        path_start = "/";
+    }
+
+    char host[256];
+    uint16_t port = default_port;
+    const char *colon = strchr(host_start, ':');
+    const char *host_end = path_start;
+
+    if (colon != NULL && colon < path_start) {
+        /* host:port format */
+        size_t hlen = colon - host_start;
+        if (hlen >= sizeof(host)) return -2;
+        memcpy(host, host_start, hlen);
+        host[hlen] = '\0';
+        port = (uint16_t)atoi(colon + 1);
+    } else {
+        size_t hlen = host_end - host_start;
+        if (hlen >= sizeof(host)) return -2;
+        memcpy(host, host_start, hlen);
+        host[hlen] = '\0';
+    }
+
+    printf("[I] AIA fetch: connecting to %s:%d%s (TLS=%d)\n", host, port, path_start, use_tls);
+
+    /* Create temporary socket */
+    mbedtls_net_context net_ctx;
+    mbedtls_net_init(&net_ctx);
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    int ret = mbedtls_net_connect(&net_ctx, host, port_str, MBEDTLS_NET_PROTO_TCP);
+    if (ret != 0) {
+        printf("[W] AIA fetch: connect failed: -0x%x\n", (unsigned int)(-ret));
+        mbedtls_net_free(&net_ctx);
+        return -3;
+    }
+
+    /* Set socket timeout to 3 seconds to prevent blocking */
+    DWORD timeout_ms = 3000;
+    setsockopt(net_ctx.fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+    setsockopt(net_ctx.fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+
+    /* TLS context (only used when use_tls == 1) */
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    int tls_initialized = 0;
+
+    if (use_tls) {
+        mbedtls_ssl_init(&ssl);
+        mbedtls_ssl_config_init(&conf);
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init(&ctr_drbg);
+        tls_initialized = 1;
+
+        ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                                     (const unsigned char *)"aia_fetch", 9);
+        if (ret != 0) {
+            printf("[E] AIA fetch: CTR_DRBG seed failed: -0x%x\n", (unsigned int)(-ret));
+            ret = -4;
+            goto cleanup;
+        }
+
+        ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT);
+        if (ret != 0) {
+            printf("[E] AIA fetch: SSL config defaults failed: -0x%x\n", (unsigned int)(-ret));
+            ret = -4;
+            goto cleanup;
+        }
+
+        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);  /* Avoid recursion */
+
+        ret = mbedtls_ssl_setup(&ssl, &conf);
+        if (ret != 0) {
+            printf("[E] AIA fetch: SSL setup failed: -0x%x\n", (unsigned int)(-ret));
+            ret = -4;
+            goto cleanup;
+        }
+
+        mbedtls_ssl_set_bio(&ssl, &net_ctx, mbedtls_net_send, mbedtls_net_recv, NULL);
+        mbedtls_ssl_set_hostname(&ssl, host);
+
+        /* Perform TLS handshake */
+        ret = mbedtls_ssl_handshake(&ssl);
+        if (ret != 0) {
+            printf("[W] AIA fetch: TLS handshake failed: -0x%x\n", (unsigned int)(-ret));
+            ret = -5;
+            goto cleanup;
+        }
+    }
+
+    /* Send HTTP GET request */
+    char http_req[512];
+    int req_len = snprintf(http_req, sizeof(http_req),
+                           "GET %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Connection: close\r\n"
+                           "User-Agent: ConvAI-SDK/1.0\r\n"
+                           "\r\n",
+                           path_start, host);
+    if (req_len <= 0 || req_len >= (int)sizeof(http_req)) {
+        ret = -5;
+        goto cleanup;
+    }
+
+    if (use_tls) {
+        ret = mbedtls_ssl_write(&ssl, (const unsigned char *)http_req, req_len);
+    } else {
+        ret = mbedtls_net_send(&net_ctx, (const unsigned char *)http_req, req_len);
+    }
+    if (ret < 0) {
+        printf("[W] AIA fetch: write failed: -0x%x\n", (unsigned int)(-ret));
+        ret = -5;
+        goto cleanup;
+    }
+    printf("[D] AIA fetch: sent %d bytes\n", ret);
+
+    /* Receive HTTP response */
+    uint8_t resp_buf[4096 + 512];  /* Cert + headers */
+    size_t total_recv = 0;
+
+    while (total_recv < sizeof(resp_buf)) {
+        if (use_tls) {
+            ret = mbedtls_ssl_read(&ssl, resp_buf + total_recv,
+                                   sizeof(resp_buf) - total_recv);
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+                ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                continue;
+            }
+        } else {
+            ret = mbedtls_net_recv(&net_ctx, resp_buf + total_recv,
+                                   sizeof(resp_buf) - total_recv);
+            if (ret < 0) {
+                printf("[D] AIA fetch: recv error: -0x%x (total_recv=%zu)\n",
+                       (unsigned int)(-ret), total_recv);
+            }
+        }
+        if (ret < 0) {
+            break;  /* EOF or error */
+        }
+        if (ret == 0) {
+            printf("[D] AIA fetch: connection closed by server (total_recv=%zu)\n", total_recv);
+            break;  /* Connection closed */
+        }
+        total_recv += ret;
+    }
+
+    if (total_recv == 0) {
+        printf("[W] AIA fetch: no response from %s\n", host);
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Parse HTTP response: find status line */
+    const char *resp_str = (const char *)resp_buf;
+    if (strncmp(resp_str, "HTTP/", 5) != 0) {
+        printf("[W] AIA fetch: invalid HTTP response\n");
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Find status code */
+    const char *status_start = strchr(resp_str, ' ');
+    if (status_start == NULL) {
+        ret = -6;
+        goto cleanup;
+    }
+    int status_code = atoi(status_start + 1);
+    if (status_code != 200) {
+        printf("[W] AIA fetch: HTTP %d from %s\n", status_code, url);
+        ret = -6;
+        goto cleanup;
+    }
+
+    /* Find body (after \r\n\r\n) */
+    const char *body_start = strstr(resp_str, "\r\n\r\n");
+    if (body_start == NULL) {
+        printf("[W] AIA fetch: no body delimiter in response\n");
+        ret = -6;
+        goto cleanup;
+    }
+    body_start += 4;
+
+    size_t body_len = total_recv - (body_start - resp_str);
+    if (body_len > out_buf_len) {
+        printf("[W] AIA fetch: response too large (%zu bytes)\n", body_len);
+        ret = -7;
+        goto cleanup;
+    }
+
+    /* Copy DER certificate to output buffer */
+    memcpy(out_der, body_start, body_len);
+    *out_der_len = body_len;
+    ret = 0;
+
+    printf("[I] AIA fetch: got %zu bytes from %s\n", body_len, url);
+
+cleanup:
+    if (tls_initialized) {
+        mbedtls_ssl_free(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+    }
+    mbedtls_net_free(&net_ctx);
+    return ret;
 }
 
 /* ===== OSAL – Memory ===== */
@@ -227,6 +491,40 @@ static char *win_strdup(const char *s) {
     return dup;
 }
 
+/* ===== OSAL – File I/O (for persistent trust store) ===== */
+static int win_file_write(const char *path, const uint8_t *data, size_t len) {
+    if (path == NULL || data == NULL) return -1;
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return -1;
+    size_t written = fwrite(data, 1, len, fp);
+    fclose(fp);
+    return (written == len) ? 0 : -1;
+}
+
+static int win_file_read(const char *path, uint8_t *buf, size_t buf_len, size_t *out_len) {
+    if (path == NULL || buf == NULL || out_len == NULL) return -1;
+    *out_len = 0;
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return -1;
+    size_t nread = fread(buf, 1, buf_len, fp);
+    fclose(fp);
+    *out_len = nread;
+    return 0;
+}
+
+static int win_file_exists(const char *path) {
+    if (path == NULL) return -1;
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return -1;
+    fclose(fp);
+    return 0;
+}
+
+static int win_file_remove(const char *path) {
+    if (path == NULL) return -1;
+    return remove(path) == 0 ? 0 : -1;
+}
+
 /* ===== NetAL – Socket ===== */
 static int win_socket_create(convai_socket_t **sock) {
     if (sock == NULL) return -1;
@@ -379,14 +677,79 @@ static int win_tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
 {
     convai_socket_t *sock = (convai_socket_t *)ctx;
     if (sock == NULL) return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
-    return mbedtls_net_send(&sock->net, buf, len);
+    int ret = mbedtls_net_send(&sock->net, buf, len);
+    printf("[D] win_tls_bio_send: len=%zu ret=%d\n", len, ret);
+    return ret;
 }
 
 static int win_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 {
     convai_socket_t *sock = (convai_socket_t *)ctx;
     if (sock == NULL) return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
-    return mbedtls_net_recv(&sock->net, buf, len);
+    int ret = mbedtls_net_recv(&sock->net, buf, len);
+    printf("[D] win_tls_bio_recv: len=%zu ret=%d\n", len, ret);
+    return ret;
+}
+
+/* Diagnostic wrapper for AIA verify callback. Logs every invocation with
+ * certificate details, delegates to AIA callback, logs result. */
+static int win_tls_verify_callback(void *ctx, mbedtls_x509_crt *crt,
+                                   int depth, uint32_t *flags)
+{
+    convai_tls_t *tls = (convai_tls_t *)ctx;
+
+    /* Extract subject and issuer CN */
+    char subject[256] = {0}, issuer[256] = {0};
+    mbedtls_x509_dn_gets(subject, sizeof(subject), &crt->subject);
+    mbedtls_x509_dn_gets(issuer, sizeof(issuer), &crt->issuer);
+
+    printf("[D] ===== verify callback: depth=%d flags=0x%08x =====\n",
+           depth, flags ? *flags : 0);
+    printf("[D]   subject: %s\n", subject);
+    printf("[D]   issuer:  %s\n", issuer);
+    printf("[D]   valid:   %04d-%02d-%02d ~ %04d-%02d-%02d\n",
+           crt->valid_from.year, crt->valid_from.mon, crt->valid_from.day,
+           crt->valid_to.year, crt->valid_to.mon, crt->valid_to.day);
+
+    if (flags && *flags) {
+        printf("[D]   verify FAIL flags: ");
+        if (*flags & 0x01) printf("EXPIRED ");
+        if (*flags & 0x02) printf("REVOKED ");
+        if (*flags & 0x04) printf("CN_MISMATCH ");
+        if (*flags & 0x08) printf("NOT_TRUSTED ");
+        if (*flags & 0x40) printf("MISSING ");
+        if (*flags & 0x0200) printf("FUTURE ");
+        printf("\n");
+    } else {
+        printf("[D]   verify OK (flags=0)\n");
+    }
+
+    if (tls == NULL) {
+        printf("[E] win_tls: verify callback has NULL context\n");
+        return 1;
+    }
+
+    /* Save peer cert raw data at depth=0 for post-handshake AIA retry */
+    if (depth == 0 && crt->raw.p != NULL && crt->raw.len <= sizeof(tls->saved_peer_cert)) {
+        memcpy(tls->saved_peer_cert, crt->raw.p, crt->raw.len);
+        tls->saved_peer_cert_len = crt->raw.len;
+        printf("[D]   saved peer cert (%zu bytes) for AIA retry\n", crt->raw.len);
+    }
+
+    /* Delegate to AIA callback with the CA chain */
+    uint32_t flags_before = flags ? *flags : 0;
+    int ret = convai_aia_verify_callback(&tls->cacert, crt, depth, flags);
+    uint32_t flags_after = flags ? *flags : 0;
+
+    if (flags_before != flags_after) {
+        printf("[D]   AIA callback changed flags: 0x%08x -> 0x%08x\n",
+               flags_before, flags_after);
+    } else {
+        printf("[D]   AIA callback: flags unchanged (0x%08x), ret=%d\n",
+               flags_after, ret);
+    }
+    printf("[D] ===== end verify callback =====\n");
+    return ret;
 }
 
 static int win_tls_create(convai_tls_t **tls)
@@ -424,6 +787,12 @@ static int win_tls_create(convai_tls_t **tls)
 
     ret = mbedtls_ssl_setup(&t->ssl, &t->conf);
     if (ret != 0) goto tls_create_fail;
+
+    /* Register HTTPS fetch callback for AIA certificate chasing */
+    convai_aia_chain_set_https_fetch(win_https_fetch_ca_der);
+
+    /* Enable force-test mode to trigger AIA even when verification passes */
+    convai_aia_chain_set_force_test(1);
 
     *tls = t;
     return 0;
@@ -478,10 +847,17 @@ static int win_tls_connect(convai_tls_t *tls, void *sock, const char *host,
             printf("[E] win_tls: CA cert parse failed: -0x%x\n", (unsigned int)(-ret));
             return -1;
         }
+        /* Log CA cert info */
+        char ca_info[512] = {0};
+        mbedtls_x509_crt_info(ca_info, sizeof(ca_info), "", &tls->cacert);
+        printf("[I] CA cert loaded (%d bytes):\n%s", (int)strlen(ca_cert), ca_info);
+
         mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->cacert, NULL);
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        printf("[I] VERIFY_REQUIRED (CA cert loaded, %d bytes)\n",
-               (int)strlen(ca_cert));
+        /* Diagnostic wrapper: log every verify callback invocation, then
+         * delegate to the AIA callback which does chain auto-completion. */
+        mbedtls_ssl_conf_verify(&tls->conf, win_tls_verify_callback, tls);
+        printf("[I] VERIFY_REQUIRED enabled, hostname=%s\n", host);
     } else {
         /* No CA cert — skip verification (test/custom environments). */
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_NONE);
@@ -501,21 +877,161 @@ static int win_tls_handshake_step(convai_tls_t *tls, int *want_flags, int *done)
     *want_flags = 0;
     *done = 0;
 
+    printf("[D] win_tls: handshake_step called, connected=%d\n", tls->connected);
+
     int ret = mbedtls_ssl_handshake(&tls->ssl);
+    printf("[D] win_tls: mbedtls_ssl_handshake returned -0x%x\n", ret ? (unsigned int)(-ret) : 0);
+
     if (ret == 0) {
         tls->connected = 1;
         *done = 1;
+        printf("[I] win_tls: handshake complete, %s / %s\n",
+               mbedtls_ssl_get_version(&tls->ssl),
+               mbedtls_ssl_get_ciphersuite(&tls->ssl));
         return 0;
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
         *want_flags = CONVAI_POLL_READ;
+        printf("[D] win_tls: handshake wants READ\n");
         return 0;
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         *want_flags = CONVAI_POLL_WRITE;
+        printf("[D] win_tls: handshake wants WRITE\n");
         return 0;
     }
+
+    /* Log all other errors */
+    printf("[E] win_tls: handshake error -0x%x\n", (unsigned int)(-ret));
+
+    /* Check if this is a certificate verification failure that we can fix with AIA */
+    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(&tls->ssl);
+        printf("[I] win_tls: certificate verify failed, flags=0x%08x\n", flags);
+
+        /* If NOT_TRUSTED and we haven't tried AIA yet, try to fetch intermediate cert */
+        if ((flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) && !tls->aia_attempted) {
+            tls->aia_attempted = 1;
+            printf("[I] win_tls: attempting AIA chain completion...\n");
+
+            /* Get peer certificate - try saved cert first, then SSL context */
+            const uint8_t *peer_cert_data = NULL;
+            size_t peer_cert_len = 0;
+
+            if (tls->saved_peer_cert_len > 0) {
+                peer_cert_data = tls->saved_peer_cert;
+                peer_cert_len = tls->saved_peer_cert_len;
+                printf("[I] win_tls: using saved peer cert (%zu bytes)\n", peer_cert_len);
+            } else {
+                const mbedtls_x509_crt *peer_crt = mbedtls_ssl_get_peer_cert(&tls->ssl);
+                if (peer_crt != NULL) {
+                    peer_cert_data = peer_crt->raw.p;
+                    peer_cert_len = peer_crt->raw.len;
+                    printf("[I] win_tls: got peer cert from SSL context (%zu bytes)\n", peer_cert_len);
+                }
+            }
+
+            if (peer_cert_data != NULL && peer_cert_len > 0) {
+                printf("[I] win_tls: parsing AIA URLs from peer cert...\n");
+
+                /* Parse AIA URLs from peer certificate */
+                convai_aia_info_t aia_info;
+                int parse_ret = convai_aia_parse_cert(peer_cert_data, peer_cert_len,
+                                                       0, &aia_info);
+                if (parse_ret == 0 && aia_info.url_count > 0) {
+                    printf("[I] win_tls: found %d AIA URL(s)\n", aia_info.url_count);
+
+                    /* Try to fetch intermediate certificate from any URL */
+                    for (int i = 0; i < aia_info.url_count; i++) {
+                        const char *url = aia_info.urls[i];
+
+                        printf("[I] win_tls: fetching intermediate from %s\n", url);
+
+                        uint8_t fetched_der[4096];
+                        size_t fetched_len = 0;
+                        int fetch_ret = win_https_fetch_ca_der(url, fetched_der,
+                                                               sizeof(fetched_der),
+                                                               &fetched_len);
+                        if (fetch_ret == 0 && fetched_len > 0) {
+                            printf("[I] win_tls: fetched %zu bytes, adding to CA chain\n",
+                                   fetched_len);
+
+                            /* Parse and add to CA chain */
+                            mbedtls_x509_crt *intermediate = calloc(1, sizeof(mbedtls_x509_crt));
+                            if (intermediate != NULL) {
+                                mbedtls_x509_crt_init(intermediate);
+                                int cert_ret = mbedtls_x509_crt_parse_der(intermediate,
+                                                                           fetched_der,
+                                                                           fetched_len);
+                                if (cert_ret == 0) {
+                                    /* Add to CA chain */
+                                    mbedtls_x509_crt *cur = &tls->cacert;
+                                    while (cur->next != NULL) cur = cur->next;
+                                    cur->next = intermediate;
+
+                                    printf("[I] win_tls: intermediate cert added, retrying handshake\n");
+
+                                    /* Reset SSL state for retry */
+                                    mbedtls_ssl_session_reset(&tls->ssl);
+
+                                    /* Continue handshake (will be called again) */
+                                    return 0;
+                                } else {
+                                    printf("[E] win_tls: failed to parse intermediate cert: -0x%x\n",
+                                           (unsigned int)(-cert_ret));
+                                    mbedtls_x509_crt_free(intermediate);
+                                    free(intermediate);
+                                }
+                            }
+                        } else {
+                            printf("[W] win_tls: failed to fetch from %s (ret=%d)\n", url, fetch_ret);
+                        }
+                    }
+                } else {
+                    printf("[W] win_tls: no AIA URLs found in peer certificate\n");
+                }
+            } else {
+                printf("[W] win_tls: no peer certificate available (saved=%zu, ssl=%p)\n",
+                       tls->saved_peer_cert_len, (void*)mbedtls_ssl_get_peer_cert(&tls->ssl));
+            }
+        }
+    }
+
     printf("[E] win_tls: handshake failed: -0x%x\n", (unsigned int)(-ret));
+
+    /* Human-readable error string */
+    char errbuf[256] = {0};
+    mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+    printf("[E]   error: %s\n", errbuf);
+
+    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(&tls->ssl);
+        printf("[E] win_tls: certificate verify failed, flags=0x%08x\n", flags);
+        if (flags & MBEDTLS_X509_BADCERT_EXPIRED)
+            printf("[E]   - certificate expired\n");
+        if (flags & MBEDTLS_X509_BADCERT_REVOKED)
+            printf("[E]   - certificate revoked\n");
+        if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
+            printf("[E]   - CN mismatch\n");
+        if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+            printf("[E]   - certificate not trusted (CA chain incomplete?)\n");
+        if (flags & MBEDTLS_X509_BADCERT_MISSING)
+            printf("[E]   - certificate missing\n");
+        if (flags & MBEDTLS_X509_BADCERT_SKIP_VERIFY)
+            printf("[E]   - verification skipped\n");
+        if (flags & MBEDTLS_X509_BADCERT_FUTURE)
+            printf("[E]   - certificate from future\n");
+
+        /* Dump peer certificate info */
+        const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&tls->ssl);
+        if (peer != NULL) {
+            char peer_info[1024] = {0};
+            mbedtls_x509_crt_info(peer_info, sizeof(peer_info), "    ", peer);
+            printf("[E] Peer certificate:\n%s\n", peer_info);
+        } else {
+            printf("[E] No peer certificate available\n");
+        }
+    }
     return -1;
 }
 
@@ -595,6 +1111,7 @@ static int win_socket_poll(convai_socket_t *sock, int events, int *revents, int 
 
     /* Windows select() ignores the nfds argument; pass 0. */
     int ret = select(0, &rfds, &wfds, &efds, ptv);
+    printf("[D] win_net: poll fd=%d events=0x%x timeout=%dms ret=%d\n", fd, events, timeout_ms, ret);
     if (ret == SOCKET_ERROR) {
         printf("[E] win_net: select failed fd=%d WSA error=%d\n", fd, WSAGetLastError());
         return -1;
@@ -602,6 +1119,7 @@ static int win_socket_poll(convai_socket_t *sock, int events, int *revents, int 
     if (FD_ISSET((SOCKET)fd, &rfds)) *revents |= CONVAI_POLL_READ;
     if (FD_ISSET((SOCKET)fd, &wfds)) *revents |= CONVAI_POLL_WRITE;
     if (FD_ISSET((SOCKET)fd, &efds)) *revents |= CONVAI_POLL_WRITE;
+    printf("[D] win_net: poll revents=0x%x\n", *revents);
     return 0;  /* ret==0: timed out, no event */
 }
 
@@ -689,6 +1207,10 @@ static const convai_platform_t g_convai_platform = {
         .thread_destroy = win_thread_destroy,
         .fill_random = win_fill_random,
         .strdup = win_strdup,
+        .file_write = win_file_write,
+        .file_read = win_file_read,
+        .file_exists = win_file_exists,
+        .file_remove = win_file_remove,
     },
     .netal = {
         .socket_create = win_socket_create,
@@ -751,5 +1273,13 @@ int convai_platform_win_init(void) {
         }
         memcpy(p, &g_convai_platform, sizeof(convai_platform_t));
     }
+
+    /* Initialize AIA chain completion subsystem */
+    convai_aia_chain_init();
+
+    /* Configure persistent trust store for AIA certificate caching */
+    convai_aia_chain_set_truststore("./trust_store");
+
     return convai_platform_init(p);
 }
+

@@ -223,3 +223,55 @@ char *esp32_strdup(const char *s) {
   }
   return strdup(s);
 }
+
+/* ===================================================================
+ *  File I/O (for persistent trust store)
+ * =================================================================== */
+
+int esp32_file_write(const char *path, const uint8_t *data, size_t len) {
+  if (path == NULL || data == NULL) {
+    return -1;
+  }
+  FILE *fp = fopen(path, "wb");
+  if (fp == NULL) {
+    return -1;
+  }
+  size_t written = fwrite(data, 1, len, fp);
+  fclose(fp);
+  return (written == len) ? 0 : -1;
+}
+
+int esp32_file_read(const char *path, uint8_t *buf, size_t buf_len, size_t *out_len) {
+  if (path == NULL || buf == NULL || out_len == NULL) {
+    return -1;
+  }
+  *out_len = 0;
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return -1;
+  }
+  size_t nread = fread(buf, 1, buf_len, fp);
+  fclose(fp);
+  *out_len = nread;
+  return 0;
+}
+
+int esp32_file_exists(const char *path) {
+  if (path == NULL) {
+    return -1;
+  }
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return -1;
+  }
+  fclose(fp);
+  return 0;
+}
+
+int esp32_file_remove(const char *path) {
+  if (path == NULL) {
+    return -1;
+  }
+  return remove(path) == 0 ? 0 : -1;
+}
+
