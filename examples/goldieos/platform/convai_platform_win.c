@@ -791,9 +791,6 @@ static int win_tls_create(convai_tls_t **tls)
     /* Register HTTPS fetch callback for AIA certificate chasing */
     convai_aia_chain_set_https_fetch(win_https_fetch_ca_der);
 
-    /* Enable force-test mode to trigger AIA even when verification passes */
-    convai_aia_chain_set_force_test(1);
-
     *tls = t;
     return 0;
 

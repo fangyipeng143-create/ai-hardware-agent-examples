@@ -18,6 +18,10 @@
 #include "goldie_osal.h"
 #include "app_codec.h"
 
+/* Forward declarations for AIA chain APIs (SDK internal headers not accessible here) */
+extern void convai_aia_chain_set_truststore(const char *root_path);
+
+#include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -115,8 +119,6 @@ static void on_message_data(convai_engine_t e, const void *data, size_t len,
 {
     (void)ud;
 
-    printf("[convai_bridge] MESSAGE: %.*s (binary=%d)\n",
-           (int)len, (const char *)data, info ? info->is_binary : 0);
 
     /* Pass raw JSON to the app layer via generic callback */
     if (g_message_cb && !(info && info->is_binary)) {
@@ -146,6 +148,29 @@ void convai_bridge_init(void)
     if (convai_config_file_init() == 0) {
         printf("[convai_bridge] runtime config loaded from convai.cfg\n");
     }
+
+    /* Initialize AIA truststore for certificate persistence.
+     * Creates <exe_dir>/truststore/dynamic/ and sets it as the cache root. */
+#ifdef _WIN32
+    {
+        char exe_path[MAX_PATH];
+        DWORD len = GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+        if (len > 0 && len < sizeof(exe_path)) {
+            char *sep = strrchr(exe_path, '\\');
+            if (!sep) sep = strrchr(exe_path, '/');
+            if (sep) {
+                *sep = '\0';
+                char ts_path[MAX_PATH], dyn_path[MAX_PATH];
+                snprintf(ts_path, sizeof(ts_path), "%s\\truststore", exe_path);
+                snprintf(dyn_path, sizeof(dyn_path), "%s\\dynamic", ts_path);
+                CreateDirectoryA(ts_path, NULL);
+                CreateDirectoryA(dyn_path, NULL);
+                convai_aia_chain_set_truststore(ts_path);
+                printf("[convai_bridge] AIA truststore: %s\n", ts_path);
+            }
+        }
+    }
+#endif
 
     /* Platform init must be done by the app layer before calling this — bridge
      * is platform-agnostic and does not call any platform-specific init. */
@@ -404,5 +429,6 @@ void convai_bridge_on_status(convai_bridge_status_cb cb)   { g_status_cb  = cb; 
 void convai_bridge_on_event(convai_bridge_event_cb cb)     { g_event_cb   = cb; }
 void convai_bridge_on_message(convai_bridge_message_cb cb) { g_message_cb = cb; }
 void convai_bridge_on_tap_state(convai_bridge_tap_state_cb cb) { bridge_tap_set_state_cb(cb); }
+
 
 
